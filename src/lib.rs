@@ -147,6 +147,13 @@ impl core::fmt::Display for LoadError {
     }
 }
 
+#[cfg(feature = "fs")]
+enum CanonicalizedPath {
+    Other,
+    FontFile(std::path::PathBuf),
+    Directory(std::path::PathBuf),
+}
+
 /// A font database.
 #[derive(Clone, Debug)]
 pub struct Database {
@@ -311,17 +318,35 @@ impl Database {
         path: std::path::PathBuf,
         entry: std::fs::DirEntry,
         seen: &mut std::collections::HashSet<std::path::PathBuf>,
-    ) -> Option<(std::path::PathBuf, std::fs::FileType)> {
-        let file_type = entry.file_type().ok()?;
+    ) -> CanonicalizedPath {
+        let Ok(file_type) = entry.file_type() else {
+            return CanonicalizedPath::Other;
+        };
+
+        #[rustfmt::skip] // keep extensions match as is
+        fn is_font_file(path: &std::path::Path) -> bool {
+            matches!(path.extension().and_then(|e| e.to_str()),
+                     Some("ttf") | Some("ttc") | Some("TTF") | Some("TTC") |
+                     Some("otf") | Some("otc") | Some("OTF") | Some("OTC"))
+        }
+
+        let original_is_font_file = is_font_file(&path);
+
         if !file_type.is_symlink() {
             if !seen.is_empty() {
                 if seen.contains(&path) {
-                    return None;
+                    return CanonicalizedPath::Other;
                 }
                 seen.insert(path.clone());
             }
 
-            return Some((path, file_type));
+            if file_type.is_file() && original_is_font_file {
+                return CanonicalizedPath::FontFile(path);
+            } else if file_type.is_dir() {
+                return CanonicalizedPath::Directory(path);
+            } else {
+                return CanonicalizedPath::Other;
+            }
         }
 
         if seen.is_empty() && file_type.is_dir() {
@@ -338,17 +363,28 @@ impl Database {
             }
         }
 
-        let stat = std::fs::metadata(&path).ok()?;
+        let Ok(stat) = std::fs::metadata(&path) else {
+            return CanonicalizedPath::Other;
+        };
         if stat.is_symlink() {
-            return None;
+            return CanonicalizedPath::Other;
         }
 
-        let canon = std::fs::canonicalize(path).ok()?;
+        let Ok(canon) = std::fs::canonicalize(path) else {
+            return CanonicalizedPath::Other;
+        };
         if seen.contains(&canon) {
-            return None;
+            return CanonicalizedPath::Other;
         }
         seen.insert(canon.clone());
-        Some((canon, stat.file_type()))
+        let file_type = stat.file_type();
+        if file_type.is_file() && (original_is_font_file || is_font_file(&canon)) {
+            CanonicalizedPath::FontFile(canon)
+        } else if file_type.is_dir() {
+            CanonicalizedPath::Directory(canon)
+        } else {
+            CanonicalizedPath::Other
+        }
     }
 
     // A non-generic version.
@@ -364,24 +400,14 @@ impl Database {
         };
 
         for entry in fonts_dir.flatten() {
-            let (path, file_type) = match self.canonicalize(entry.path(), entry, seen) {
-                Some(v) => v,
-                None => continue,
-            };
-
-            if file_type.is_file() {
-                match path.extension().and_then(|e| e.to_str()) {
-                    #[rustfmt::skip] // keep extensions match as is
-                    Some("ttf") | Some("ttc") | Some("TTF") | Some("TTC") |
-                    Some("otf") | Some("otc") | Some("OTF") | Some("OTC") => {
-                        if let Err(e) = self.load_font_file(&path) {
-                            log::warn!("Failed to load '{}' cause {}.", path.display(), e);
-                        }
-                    },
-                    _ => {}
+            match self.canonicalize(entry.path(), entry, seen) {
+                CanonicalizedPath::FontFile(path) => {
+                    if let Err(e) = self.load_font_file(&path) {
+                        log::warn!("Failed to load '{}' cause {}.", path.display(), e);
+                    }
                 }
-            } else if file_type.is_dir() {
-                self.load_fonts_dir_impl(&path, seen);
+                CanonicalizedPath::Directory(path) => self.load_fonts_dir_impl(&path, seen),
+                CanonicalizedPath::Other => {}
             }
         }
     }
@@ -474,7 +500,6 @@ impl Database {
             }
         }
     }
-
 
     // Linux.
     #[cfg(all(
