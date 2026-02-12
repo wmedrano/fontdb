@@ -39,3 +39,7 @@ memmap = ["fs", "memmap2"]
 # Enables minimal fontconfig support on Linux.
 # Must be enabled for NixOS, otherwise no fonts will be loaded.
 fontconfig = ["fontconfig-parser", "fs"]
+
+[[example]]
+name = "print_fonts"
+required-features = ["fs"]
